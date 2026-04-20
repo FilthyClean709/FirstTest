@@ -33,7 +33,8 @@
     NetBIOSName         = 'LAB'
 
     # Forest / Domain functional levels
-    # Accepted values: Win2008, Win2008R2, Win2012, Win2012R2, WinThreshold (2016), Win2025
+    # Accepted values: Win2008, Win2008R2, Win2012, Win2012R2, WinThreshold (2016/2019/2022),
+    #                  Windows2025Forest / Windows2025Domain (Server 2025 native level)
     ForestLevel         = 'WinThreshold'
     DomainLevel         = 'WinThreshold'
 

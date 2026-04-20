@@ -21,6 +21,7 @@ A set of PowerShell scripts that take a fresh Server 2025 install from bare meta
 | File | Purpose |
 |---|---|
 | `config.psd1` | All environment-specific settings — **edit this first** |
+| `Helpers.ps1` | Shared functions dot-sourced by all scripts — do not run directly |
 | `1-PrepServer.ps1` | Rename, network config, role installation |
 | `2-PromoteDC.ps1` | AD DS forest promotion |
 | `3-PostConfig.ps1` | DNS, NTP, Recycle Bin, OUs, groups |
@@ -79,7 +80,7 @@ Open `config.psd1` in Notepad or VS Code and change every value marked below.
 |---|---|---|
 | `Timezone` | `Eastern Standard Time` | Run `Get-TimeZone -ListAvailable` for valid IDs |
 | `AdapterName` | `Ethernet` | Run `Get-NetAdapter` to verify the name on your NIC |
-| `ForestLevel` / `DomainLevel` | `WinThreshold` | Windows Server 2016-level; change to `Win2025` if you need Server 2025 features |
+| `ForestLevel` / `DomainLevel` | `WinThreshold` | 2016/2019/2022-level; change to `Windows2025Forest` / `Windows2025Domain` for Server 2025 native features |
 | `NTDSPath` / `LogPath` / `SysvolPath` | `C:\Windows\...` | Move to a dedicated volume on production |
 | `DNSForwarders` | `8.8.8.8`, `8.8.4.4` | Replace with your ISP or preferred public DNS |
 | `BaselineOUs` | See file | Add or remove OU names freely |

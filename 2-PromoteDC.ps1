@@ -4,9 +4,9 @@
 
 .DESCRIPTION
     - Loads settings from config.psd1
-    - Prompts for the DSRM (Directory Services Restore Mode) password interactively
-    - Runs Install-ADDSForest
-    - The server will reboot automatically upon successful promotion
+    - Prompts for the DSRM password interactively (skipped with -DryRun)
+    - Runs Install-ADDSForest with parameters from config
+    - The server auto-reboots upon successful promotion
 
 .PARAMETER DryRun
     Validate configuration and display planned parameters without performing the promotion.
@@ -29,44 +29,21 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Logging
+# Bootstrap helpers and config
 # ---------------------------------------------------------------------------
-$scriptDir  = $PSScriptRoot
-$logDir     = Join-Path $scriptDir 'Logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+. (Join-Path $PSScriptRoot 'Helpers.ps1')
+
+$logDir     = New-LogDir -ScriptDir $PSScriptRoot
 $transcript = Join-Path $logDir ("PromoteDC_{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 Start-Transcript -Path $transcript -Append
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-function Write-Step  { param($msg) Write-Host "`n[STEP] $msg" -ForegroundColor Cyan   }
-function Write-OK    { param($msg) Write-Host "  [OK] $msg"   -ForegroundColor Green  }
-function Write-Warn  { param($msg) Write-Host "  [WARN] $msg" -ForegroundColor Yellow }
-function Write-Fail  { param($msg) Write-Host "  [ERR] $msg"  -ForegroundColor Red    }
-
-function Assert-Config {
-    param([hashtable]$Cfg, [string[]]$Keys)
-    foreach ($k in $Keys) {
-        if (-not $Cfg.ContainsKey($k) -or [string]::IsNullOrWhiteSpace($Cfg[$k])) {
-            throw "config.psd1 is missing required value: '$k'"
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Load config
-# ---------------------------------------------------------------------------
+$cfgPath = Get-ConfigPath -ScriptDir $PSScriptRoot
 Write-Step 'Loading configuration'
-$cfgPath = Join-Path $scriptDir 'config.psd1'
-if (-not (Test-Path $cfgPath)) { throw "config.psd1 not found at: $cfgPath" }
-
 $cfg = Import-PowerShellDataFile -Path $cfgPath
-
-$required = @('DomainFQDN','NetBIOSName','ForestLevel','DomainLevel',
-              'NTDSPath','LogPath','SysvolPath')
-Assert-Config -Cfg $cfg -Keys $required
-
+Assert-Config -Cfg $cfg -Keys @(
+    'DomainFQDN','NetBIOSName','ForestLevel','DomainLevel',
+    'NTDSPath','LogPath','SysvolPath'
+)
 Write-OK "Config loaded from $cfgPath"
 
 # ---------------------------------------------------------------------------
@@ -74,8 +51,7 @@ Write-OK "Config loaded from $cfgPath"
 # ---------------------------------------------------------------------------
 Write-Step 'Verifying AD DS role is installed'
 try {
-    $feature = Get-WindowsFeature -Name AD-Domain-Services
-    if (-not $feature.Installed) {
+    if (-not (Get-WindowsFeature -Name AD-Domain-Services).Installed) {
         throw 'AD-Domain-Services role is not installed. Run 1-PrepServer.ps1 first and reboot.'
     }
     Write-OK 'AD DS role is installed.'
@@ -88,60 +64,28 @@ try {
 # ---------------------------------------------------------------------------
 # Check if domain already exists
 # ---------------------------------------------------------------------------
-Write-Step "Checking whether domain '$($cfg.DomainFQDN)' already exists"
+Write-Step "Checking whether this server is already domain-joined"
 try {
     $null = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-    Write-Warn "This server appears to already be a domain member. Promotion may be unnecessary."
-    Write-Warn "If this is unexpected, verify the environment before continuing."
+    Write-Warn 'This server is already a domain member — promotion may be unnecessary.'
+    Write-Warn 'Verify the environment before continuing.'
 } catch [System.DirectoryServices.ActiveDirectory.ActiveDirectoryObjectNotFoundException] {
-    Write-OK "Server is in a workgroup — promotion can proceed."
+    Write-OK 'Server is in a workgroup — promotion can proceed.'
 } catch {
-    Write-OK "Server is not yet domain-joined — promotion can proceed."
+    Write-OK 'Server is not domain-joined — promotion can proceed.'
 }
-
-# ---------------------------------------------------------------------------
-# Prompt for DSRM password
-# ---------------------------------------------------------------------------
-Write-Step 'DSRM password'
-Write-Host '  The Directory Services Restore Mode (DSRM) password is required.' -ForegroundColor Cyan
-Write-Host '  It must be stored securely — you will need it to recover AD DS.' -ForegroundColor Yellow
-
-$dsrmPassword = $null
-$confirm      = $null
-do {
-    $dsrmPassword = Read-Host -Prompt '  Enter DSRM password'    -AsSecureString
-    $confirm      = Read-Host -Prompt '  Confirm DSRM password'  -AsSecureString
-
-    $plain1 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($dsrmPassword))
-    $plain2 = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                  [Runtime.InteropServices.Marshal]::SecureStringToBSTR($confirm))
-
-    if ($plain1 -ne $plain2) {
-        Write-Warn 'Passwords do not match — please try again.'
-        $dsrmPassword = $null
-    } elseif ($plain1.Length -lt 8) {
-        Write-Warn 'Password must be at least 8 characters — please try again.'
-        $dsrmPassword = $null
-    }
-
-    [Runtime.InteropServices.Marshal]::ZeroFreeCoTaskMemUnicode(
-        [Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($dsrmPassword ?? (ConvertTo-SecureString ' ' -AsPlainText -Force)))
-} until ($dsrmPassword)
-
-Write-OK 'DSRM password accepted.'
 
 # ---------------------------------------------------------------------------
 # Show promotion plan
 # ---------------------------------------------------------------------------
 Write-Step 'Promotion parameters'
-Write-Host "  Domain FQDN      : $($cfg.DomainFQDN)"     -ForegroundColor Cyan
-Write-Host "  NetBIOS Name     : $($cfg.NetBIOSName)"     -ForegroundColor Cyan
-Write-Host "  Forest Level     : $($cfg.ForestLevel)"     -ForegroundColor Cyan
-Write-Host "  Domain Level     : $($cfg.DomainLevel)"     -ForegroundColor Cyan
-Write-Host "  NTDS Path        : $($cfg.NTDSPath)"        -ForegroundColor Cyan
-Write-Host "  Log Path         : $($cfg.LogPath)"         -ForegroundColor Cyan
-Write-Host "  SYSVOL Path      : $($cfg.SysvolPath)"      -ForegroundColor Cyan
+Write-Host "  Domain FQDN      : $($cfg.DomainFQDN)"  -ForegroundColor Cyan
+Write-Host "  NetBIOS Name     : $($cfg.NetBIOSName)"  -ForegroundColor Cyan
+Write-Host "  Forest Level     : $($cfg.ForestLevel)"  -ForegroundColor Cyan
+Write-Host "  Domain Level     : $($cfg.DomainLevel)"  -ForegroundColor Cyan
+Write-Host "  NTDS Path        : $($cfg.NTDSPath)"     -ForegroundColor Cyan
+Write-Host "  Log Path         : $($cfg.LogPath)"      -ForegroundColor Cyan
+Write-Host "  SYSVOL Path      : $($cfg.SysvolPath)"   -ForegroundColor Cyan
 
 if ($DryRun) {
     Write-Warn 'DRY RUN — Install-ADDSForest will NOT be called.'
@@ -150,17 +94,56 @@ if ($DryRun) {
 }
 
 # ---------------------------------------------------------------------------
-# Promote
+# Prompt for DSRM password (after DryRun short-circuit so it is never prompted in dry runs)
+# ---------------------------------------------------------------------------
+Write-Step 'DSRM password'
+Write-Host '  The Directory Services Restore Mode (DSRM) password is required.' -ForegroundColor Cyan
+Write-Host '  Store it securely — you need it to recover AD DS.' -ForegroundColor Yellow
+
+$dsrmPassword = $null
+do {
+    $ss1 = Read-Host -Prompt '  Enter DSRM password'   -AsSecureString
+    $ss2 = Read-Host -Prompt '  Confirm DSRM password' -AsSecureString
+
+    # Convert to plaintext in native memory, compare, then immediately zero the buffers.
+    $ptr1 = [IntPtr]::Zero
+    $ptr2 = [IntPtr]::Zero
+    try {
+        $ptr1   = [Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($ss1)
+        $ptr2   = [Runtime.InteropServices.Marshal]::SecureStringToCoTaskMemUnicode($ss2)
+        $plain1 = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr1)
+        $plain2 = [Runtime.InteropServices.Marshal]::PtrToStringUni($ptr2)
+
+        if ($plain1 -ne $plain2) {
+            Write-Warn 'Passwords do not match — please try again.'
+        } elseif ($plain1.Length -lt 8) {
+            Write-Warn 'Password must be at least 8 characters — please try again.'
+        } else {
+            $dsrmPassword = $ss1
+        }
+    } finally {
+        if ($ptr1 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeCoTaskMemUnicode($ptr1) }
+        if ($ptr2 -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeCoTaskMemUnicode($ptr2) }
+    }
+} until ($null -ne $dsrmPassword)
+
+Write-OK 'DSRM password accepted.'
+
+# ---------------------------------------------------------------------------
+# Final confirmation before promotion
 # ---------------------------------------------------------------------------
 Write-Step "Promoting to forest root DC for '$($cfg.DomainFQDN)'"
 Write-Warn 'The server will REBOOT automatically when promotion completes.'
-$confirm2 = Read-Host 'Type YES to proceed with promotion'
-if ($confirm2 -ne 'YES') {
+$confirm = Read-Host 'Type YES to proceed with promotion'
+if ($confirm -ne 'YES') {
     Write-Warn 'Promotion cancelled by user.'
     Stop-Transcript
     exit 0
 }
 
+# ---------------------------------------------------------------------------
+# Promote
+# ---------------------------------------------------------------------------
 try {
     $promoteParams = @{
         DomainName                    = $cfg.DomainFQDN
@@ -177,8 +160,7 @@ try {
     }
 
     Install-ADDSForest @promoteParams
-    # Execution continues only if NoRebootOnCompletion were $true; in practice
-    # the server reboots here, so the lines below are a safety net.
+    # Reached only if the reboot is somehow suppressed; normally the system reboots above.
     Write-OK 'Install-ADDSForest returned — reboot should be imminent.'
 } catch {
     Write-Fail "Promotion failed: $_"

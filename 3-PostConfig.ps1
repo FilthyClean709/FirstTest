@@ -4,15 +4,16 @@
 
 .DESCRIPTION
     - Verifies AD DS, DNS, and Netlogon services are running
-    - Creates a DNS reverse lookup zone
+    - Creates a DNS reverse lookup zone derived from the configured IP and prefix length
     - Configures DNS forwarders
-    - Configures the PDC emulator as the authoritative NTP source
+    - Configures the PDC emulator as the authoritative NTP source via w32tm
     - Enables the AD Recycle Bin
     - Creates baseline OUs and security groups from config.psd1
+    - Sets loopback (127.0.0.1) as primary DNS on the DC NIC
     - Writes a summary report to .\Logs\
 
 .PARAMETER DryRun
-    Show what would be done without making changes.
+    Show what would be done without making any changes.
 
 .NOTES
     Author : <your name>
@@ -32,11 +33,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ---------------------------------------------------------------------------
-# Logging
+# Bootstrap helpers and config
 # ---------------------------------------------------------------------------
-$scriptDir  = $PSScriptRoot
-$logDir     = Join-Path $scriptDir 'Logs'
-if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
+. (Join-Path $PSScriptRoot 'Helpers.ps1')
+
+$logDir     = New-LogDir -ScriptDir $PSScriptRoot
 $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
 $transcript = Join-Path $logDir "PostConfig_$timestamp.log"
 $report     = Join-Path $logDir "PostConfig_Summary_$timestamp.txt"
@@ -45,32 +46,18 @@ Start-Transcript -Path $transcript -Append
 $summaryLines = [System.Collections.Generic.List[string]]::new()
 function Add-Summary { param($line) $summaryLines.Add($line) }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-function Write-Step  { param($msg) Write-Host "`n[STEP] $msg" -ForegroundColor Cyan   }
-function Write-OK    { param($msg) Write-Host "  [OK] $msg"   -ForegroundColor Green  ; Add-Summary "  OK   : $msg" }
-function Write-Warn  { param($msg) Write-Host "  [WARN] $msg" -ForegroundColor Yellow ; Add-Summary "  WARN : $msg" }
-function Write-Fail  { param($msg) Write-Host "  [ERR] $msg"  -ForegroundColor Red    ; Add-Summary "  ERR  : $msg" }
+# Override helpers to also append to summary list
+function Write-OK   { param([string]$msg) Write-Host "  [OK] $msg"   -ForegroundColor Green  ; Add-Summary "  OK   : $msg" }
+function Write-Warn { param([string]$msg) Write-Host "  [WARN] $msg" -ForegroundColor Yellow ; Add-Summary "  WARN : $msg" }
+function Write-Fail { param([string]$msg) Write-Host "  [ERR] $msg"  -ForegroundColor Red    ; Add-Summary "  ERR  : $msg" }
 
-function Assert-Config {
-    param([hashtable]$Cfg, [string[]]$Keys)
-    foreach ($k in $Keys) {
-        if (-not $Cfg.ContainsKey($k) -or ($null -eq $Cfg[$k])) {
-            throw "config.psd1 is missing required value: '$k'"
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Load config
-# ---------------------------------------------------------------------------
+$cfgPath = Get-ConfigPath -ScriptDir $PSScriptRoot
 Write-Step 'Loading configuration'
-$cfgPath = Join-Path $scriptDir 'config.psd1'
-if (-not (Test-Path $cfgPath)) { throw "config.psd1 not found at: $cfgPath" }
-
 $cfg = Import-PowerShellDataFile -Path $cfgPath
-Assert-Config -Cfg $cfg -Keys @('DomainFQDN','IPAddress','DNSForwarders','BaselineOUs','BaselineGroups')
+Assert-Config -Cfg $cfg -Keys @(
+    'DomainFQDN','IPAddress','PrefixLength','AdapterName','SecondaryDNS',
+    'DNSForwarders','BaselineOUs','BaselineGroups'
+)
 Write-OK "Config loaded from $cfgPath"
 
 if ($DryRun) { Write-Warn 'DRY RUN — no changes will be made.' }
@@ -79,9 +66,8 @@ if ($DryRun) { Write-Warn 'DRY RUN — no changes will be made.' }
 # 1. Verify core services
 # ---------------------------------------------------------------------------
 Write-Step 'Verifying AD DS, DNS, and Netlogon services'
-$requiredServices = @('ADWS', 'DNS', 'Netlogon', 'kdc', 'W32Time')
 $allOK = $true
-foreach ($svc in $requiredServices) {
+foreach ($svc in @('ADWS', 'DNS', 'Netlogon', 'kdc', 'W32Time')) {
     try {
         $s = Get-Service -Name $svc -ErrorAction Stop
         if ($s.Status -eq 'Running') {
@@ -95,11 +81,9 @@ foreach ($svc in $requiredServices) {
         $allOK = $false
     }
 }
-if (-not $allOK) {
-    Write-Warn 'One or more services could not be verified. Continuing, but investigate.'
-}
+if (-not $allOK) { Write-Warn 'One or more services could not be verified. Continuing — investigate.' }
 
-# Give AD DS a moment to fully initialise if this is right after reboot
+# Wait for AD DS to become available (up to 60 s after reboot)
 $adReady = $false
 $retries = 0
 while (-not $adReady -and $retries -lt 6) {
@@ -115,24 +99,36 @@ while (-not $adReady -and $retries -lt 6) {
 if (-not $adReady) { throw 'AD DS did not become available after 60 seconds. Check event logs.' }
 Write-OK 'AD DS is responding.'
 
+# Cache domain info used by multiple steps below
+$domain   = Get-ADDomain
+$domainDN = $domain.DistinguishedName
+
 # ---------------------------------------------------------------------------
 # 2. DNS reverse lookup zone
 # ---------------------------------------------------------------------------
 Write-Step 'Creating DNS reverse lookup zone'
 try {
-    # Derive the reverse zone name from the IP (assumes /24; adapt for other masks)
-    $ipOctets   = $cfg.IPAddress -split '\.'
-    $reverseZone = "$($ipOctets[2]).$($ipOctets[1]).$($ipOctets[0]).in-addr.arpa"
+    $ipOctets = $cfg.IPAddress -split '\.'
+
+    # Number of octets to include in the reverse zone name is determined by the
+    # prefix length. Floor gives the right boundary for standard classes;
+    # e.g. /24 -> 3 octets, /16 -> 2 octets, /8 -> 1 octet.
+    $octetCount  = [Math]::Max(1, [Math]::Floor([int]$cfg.PrefixLength / 8))
+    $networkPart = $ipOctets[0..($octetCount - 1)]
+    $reverseZone = (($octetCount - 1)..0 | ForEach-Object { $networkPart[$_] }) -join '.'
+    $reverseZone += '.in-addr.arpa'
 
     $existing = Get-DnsServerZone -Name $reverseZone -ErrorAction SilentlyContinue
     if ($existing) {
         Write-OK "Reverse zone '$reverseZone' already exists — skipping."
     } else {
         if (-not $DryRun) {
-            Add-DnsServerPrimaryZone -NetworkId "$($ipOctets[0]).$($ipOctets[1]).$($ipOctets[2]).0/$($cfg.PrefixLength)" `
-                                     -ReplicationScope 'Forest' -DynamicUpdate 'Secure'
+            Add-DnsServerPrimaryZone `
+                -NetworkId      "$($ipOctets[0..($octetCount-1)] -join '.').0/$($cfg.PrefixLength)" `
+                -ReplicationScope 'Forest' `
+                -DynamicUpdate  'Secure'
         }
-        Write-OK "Reverse zone '$reverseZone' created."
+        Write-OK "Reverse zone '$reverseZone' created$(if ($DryRun) { ' [DryRun]' })."
     }
 } catch {
     Write-Fail "Failed to create reverse lookup zone: $_"
@@ -144,18 +140,21 @@ try {
 Write-Step 'Configuring DNS forwarders'
 try {
     $desired = $cfg.DNSForwarders
-    if (-not $DryRun) {
-        # Remove existing forwarders then add desired set
-        $current = (Get-DnsServerForwarder).IPAddress.IPAddressToString
-        $diff = Compare-Object -ReferenceObject $desired -DifferenceObject ($current ?? @())
+    if ($DryRun) {
+        Write-OK "[DryRun] Would set forwarders: $($desired -join ', ')"
+    } else {
+        $currentFwdr = Get-DnsServerForwarder
+        $currentIPs  = if ($null -ne $currentFwdr.IPAddress) {
+                           $currentFwdr.IPAddress.IPAddressToString
+                       } else { @() }
+
+        $diff = Compare-Object -ReferenceObject $desired -DifferenceObject $currentIPs
         if ($diff) {
             Set-DnsServerForwarder -IPAddress $desired
             Write-OK "DNS forwarders set to: $($desired -join ', ')"
         } else {
-            Write-OK "DNS forwarders already set to: $($desired -join ', ') — skipping."
+            Write-OK "DNS forwarders already correct: $($desired -join ', ') — skipping."
         }
-    } else {
-        Write-OK "[DryRun] Would set forwarders: $($desired -join ', ')"
     }
 } catch {
     Write-Fail "Failed to configure DNS forwarders: $_"
@@ -167,12 +166,12 @@ try {
 Write-Step 'Configuring PDC emulator as authoritative NTP source'
 try {
     if (-not $DryRun) {
-        # Point at upstream NTP servers and mark this DC as reliable
-        w32tm /config /manualpeerlist:"time.windows.com,0x8 pool.ntp.org,0x8" /syncfromflags:manual /reliable:YES /update | Out-Null
+        w32tm /config /manualpeerlist:"time.windows.com,0x8 pool.ntp.org,0x8" `
+              /syncfromflags:manual /reliable:YES /update | Out-Null
         Restart-Service W32Time -Force
         w32tm /resync /force | Out-Null
     }
-    Write-OK 'PDC emulator NTP configured (time.windows.com, pool.ntp.org) and W32Time restarted.'
+    Write-OK "NTP configured (time.windows.com, pool.ntp.org)$(if ($DryRun) { ' [DryRun]' })."
 } catch {
     Write-Fail "Failed to configure NTP: $_"
 }
@@ -182,7 +181,7 @@ try {
 # ---------------------------------------------------------------------------
 Write-Step 'Enabling AD Recycle Bin'
 try {
-    $forest = (Get-ADForest).Name
+    $forestName = (Get-ADForest).Name
     $rb = Get-ADOptionalFeature -Filter { Name -eq 'Recycle Bin Feature' } -ErrorAction Stop
 
     if ($rb.EnabledScopes.Count -gt 0) {
@@ -191,10 +190,10 @@ try {
         if (-not $DryRun) {
             Enable-ADOptionalFeature 'Recycle Bin Feature' `
                 -Scope ForestOrConfigurationSet `
-                -Target $forest `
+                -Target $forestName `
                 -Confirm:$false
         }
-        Write-OK 'AD Recycle Bin enabled.'
+        Write-OK "AD Recycle Bin enabled$(if ($DryRun) { ' [DryRun]' })."
     }
 } catch {
     Write-Fail "Failed to enable AD Recycle Bin: $_"
@@ -205,9 +204,6 @@ try {
 # ---------------------------------------------------------------------------
 Write-Step 'Creating baseline Organisational Units'
 try {
-    $domain    = Get-ADDomain
-    $domainDN  = $domain.DistinguishedName
-
     foreach ($ouName in $cfg.BaselineOUs) {
         $ouDN = "OU=$ouName,$domainDN"
         try {
@@ -215,9 +211,12 @@ try {
             Write-OK "OU '$ouName' already exists — skipping."
         } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
             if (-not $DryRun) {
-                New-ADOrganizationalUnit -Name $ouName -Path $domainDN -ProtectedFromAccidentalDeletion $true
+                New-ADOrganizationalUnit -Name $ouName -Path $domainDN `
+                                         -ProtectedFromAccidentalDeletion $true
+                Write-OK "OU '$ouName' created."
+            } else {
+                Write-OK "[DryRun] Would create OU '$ouName'."
             }
-            Write-OK "OU '$ouName' created."
         }
     }
 } catch {
@@ -229,11 +228,7 @@ try {
 # ---------------------------------------------------------------------------
 Write-Step 'Creating baseline security groups'
 try {
-    $domain    = Get-ADDomain
-    $domainDN  = $domain.DistinguishedName
-    $groupsOU  = "OU=Groups,$domainDN"
-
-    # Verify Groups OU exists (created in step above)
+    $groupsOU = "OU=Groups,$domainDN"
     try {
         $null = Get-ADOrganizationalUnit -Identity $groupsOU -ErrorAction Stop
     } catch {
@@ -247,14 +242,16 @@ try {
             Write-OK "Group '$($grp.Name)' already exists — skipping."
         } catch [Microsoft.ActiveDirectory.Management.ADIdentityNotFoundException] {
             if (-not $DryRun) {
-                New-ADGroup -Name          $grp.Name `
+                New-ADGroup -Name           $grp.Name `
                             -SamAccountName $grp.Name `
-                            -GroupScope    'Global' `
-                            -GroupCategory 'Security' `
-                            -Description   $grp.Description `
-                            -Path          $groupsOU
+                            -GroupScope     'Global' `
+                            -GroupCategory  'Security' `
+                            -Description    $grp.Description `
+                            -Path           $groupsOU
+                Write-OK "Group '$($grp.Name)' created."
+            } else {
+                Write-OK "[DryRun] Would create group '$($grp.Name)'."
             }
-            Write-OK "Group '$($grp.Name)' created."
         }
     }
 } catch {
@@ -262,7 +259,7 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# 8. Post-promotion DNS fix — set loopback as primary DNS
+# 8. Set loopback as primary DNS on the DC NIC
 # ---------------------------------------------------------------------------
 Write-Step 'Setting primary DNS to 127.0.0.1 on the DC NIC'
 try {
@@ -276,7 +273,7 @@ try {
         if (-not $DryRun) {
             Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses $desired
         }
-        Write-OK "DNS updated to: $($desired -join ', ')"
+        Write-OK "DNS updated to: $($desired -join ', ')$(if ($DryRun) { ' [DryRun]' })."
     }
 } catch {
     Write-Warn "Could not update DNS client addresses (non-fatal): $_"
@@ -297,6 +294,7 @@ $($summaryLines -join "`n")
 "@
 
 $reportContent | Out-File -FilePath $report -Encoding UTF8
+
 Write-Host "`n================================================" -ForegroundColor Green
 Write-Host " Post-configuration complete!" -ForegroundColor Green
 Write-Host " Summary report: $report"      -ForegroundColor Green
